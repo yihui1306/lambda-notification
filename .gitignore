@@ -1,0 +1,11 @@
+
+.idea/
+*.iml
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+.DS_Store
