@@ -1,0 +1,9 @@
+roboflow 
+ultralytics 
+supervision
+opencv-python-headless
+numpy
+requests
+fastapi
+uvicorn
+python-multipart
