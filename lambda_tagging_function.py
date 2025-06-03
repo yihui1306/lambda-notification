@@ -7,8 +7,7 @@ import tempfile
 from urllib.parse import unquote_plus
 import requests
 from decimal import Decimal
-
-from lambda_notification_function import sns, SNS_TOPIC_ARN
+import sns
 
 s3 = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
@@ -17,6 +16,7 @@ TABLE_NAME = os.environ.get('TABLE_NAME', 'birds-detection-data')
 REGION = os.environ.get('AWS_REGION', 'us-east-1')
 
 table = dynamodb.Table(TABLE_NAME)
+
 
 # Helper functions
 
@@ -29,6 +29,7 @@ def convert_decimals(obj):
         return int(obj) if obj % 1 == 0 else float(obj)
     return obj
 
+
 def parse_content(content):
     try:
         return json.loads(content)
@@ -40,23 +41,26 @@ def parse_content(content):
         line = line.strip()
         if not line or line.startswith('#'):
             continue
-        
+
         if ':' in line:
             tag, count = line.split(':', 1)
             count = int(count.strip()) if count.strip().isdigit() else 1
         else:
             tag, count = line, 1
-        
+
         tags.append({tag.strip(): count})
-    
+
     return tags if tags else None
+
 
 def sanitize_tags(tags):
     safe_tags = {}
     for k, v in tags.items():
-        if isinstance(k, str) and isinstance(v, (int, float)) and not (v is None or isinstance(v, float) and (v != v)):  # NaN check
+        if isinstance(k, str) and isinstance(v, (int, float)) and not (
+                v is None or isinstance(v, float) and (v != v)):  # NaN check
             safe_tags[k] = v
     return safe_tags
+
 
 def detect_birds_tags(file_path, file_type, image_url=None):
     url = f"http://54.146.219.94:8000/predict/{file_type}"
@@ -95,17 +99,17 @@ def detect_birds_tags(file_path, file_type, image_url=None):
 
 
 def lambda_handler(event, context):
-    if 'Records' in event and 's3' in event['Records'][0]:  
+    if 'Records' in event and 's3' in event['Records'][0]:
         return handle_trigger_s3(event)
-    elif 'httpMethod' in event:  
-        resource=event.get('resource', '')
+    elif 'httpMethod' in event:
+        resource = event.get('resource', '')
         path = event.get("path", "")
         http_method = event.get('httpMethod', '')
-        if http_method == 'GET' and resource=='/api/status':
+        if http_method == 'GET' and resource == '/api/status':
             return handle_api_status(event)
-        elif (http_method=='GET' or http_method=='POST') and resource == '/api/search-tags':
+        elif (http_method == 'GET' or http_method == 'POST') and resource == '/api/search-tags':
             return handle_search_by_tags(event)
-        elif http_method == 'POST' and resource=="/api/search-species":
+        elif http_method == 'POST' and resource == "/api/search-species":
             return handle_search_by_species(event)
         elif http_method == 'POST' and resource == '/api/get-original-from-thumbnail':
             return handle_get_original_from_thumbnail(event)
@@ -127,32 +131,17 @@ def lambda_handler(event, context):
         }
 
 
-
 def handle_trigger_s3(event):
     for record in event['Records']:
         key = unquote_plus(record['s3']['object']['key'])
         file_type = 'image' if key.startswith('images/original/') else 'video'
+
         tmp_file = tempfile.NamedTemporaryFile(delete=False)
         s3.download_file(BUCKET_NAME, key, tmp_file.name)
 
         tags = detect_birds_tags(tmp_file.name, file_type)
         print(f"[DEBUG] Raw API response tags: {tags}")
         tags = sanitize_tags(tags)
-
-        # new logic for notification
-        new_tags = ["hawk", "duck", "goose"]  # can change it
-        for tag in tags:
-            if tag.lower() in new_tags:
-                try:
-                    sns.publish(
-                        TopicArn=SNS_TOPIC_ARN,
-                        Subject='New Bird Tagged Alert',
-                        Message=f"New Bird Tagged has been uploaded!"
-                    )
-                    print(f"[INFO] SNS notification sent for tag: {tag}")
-                except Exception as e:
-                    print(f"[ERROR] Failed to send SNS notification: {e}")
-
 
         s3_url = f"s3://{BUCKET_NAME}/{key}"
         thumbnail_url = None
@@ -162,25 +151,44 @@ def handle_trigger_s3(event):
             thumbnail_key = key.replace('images/original/', 'images/thumbnails/')
             thumbnail_url = f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/{thumbnail_key}"
             item = {
-            'id': key,  
-            'user_id':'User999',
-            'original_url':original_url,
-            'type': file_type,
-            'thumbnail_url':thumbnail_url,
-            'tags': tags or {"unknown_bird":1}
+                'id': key,
+                'user_id': 'User999',
+                'original_url': original_url,
+                'type': file_type,
+                'thumbnail_url': thumbnail_url,
+                'tags': tags or {"unknown_bird": 1}
             }
             table.put_item(Item=item)
+
         else:
             original_url = f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/{key}"
             item = {
-            'id': key,  
-            'user_id':'User999',
-            'original_url':original_url,
-            'type': file_type,
-            'thumbnail_url':"NO_URL",
-            'tags': tags or {"unknown_bird":1}
+                'id': key,
+                'user_id': 'User999',
+                'original_url': original_url,
+                'type': file_type,
+                'thumbnail_url': "NO_URL",
+                'tags': tags or {"unknown_bird": 1}
             }
             table.put_item(Item=item)
+
+        # logic handle for notification
+        try:
+            bird_species = list(tags.keys())
+            bird_species_str = ",".join(bird_species)
+            message_email = {
+                "message": f"The new bird species has been updated: {bird_species_str}.",
+                "file_url": original_url
+            }
+
+            sns.publish(
+                TopicArn=os.environ['SNS_TOPIC_ARN'],  # change it to topic arn after create the new arn
+                Subject=f"New Bird Species Alert: {bird_species_str} ",
+                Message=json.dumps(message_email)
+            )
+            print(f"[SNS] Notification published for {original_url}")
+        except Exception as e:
+            print(f"[ERROR] Failed to send SNS notification: {e}")
 
     return {
         'statusCode': 200,
@@ -225,9 +233,11 @@ def handle_search_by_tags(event):
             item_tags = item.get('tags', {})
             if all(item_tags.get(tag, 0) >= count for tag, count in tags.items()):
                 if item['type'] == 'image':
-                    matches.append({"original_url":item['original_url'],"thumbnail_url":item['thumbnail_url'],"type":item['type']})
+                    matches.append({"original_url": item['original_url'], "thumbnail_url": item['thumbnail_url'],
+                                    "type": item['type']})
                 else:
-                    matches.append({"original_url":item['original_url'],"thumbnail_url":item['thumbnail_url'],"type":item['type']})
+                    matches.append({"original_url": item['original_url'], "thumbnail_url": item['thumbnail_url'],
+                                    "type": item['type']})
 
         return {
             "statusCode": 200,
@@ -320,7 +330,6 @@ def handle_get_original_from_thumbnail(event):
                 "body": json.dumps({"error": "Missing 'thumbnail_url' in request body"})
             }
 
-        
         response = table.scan()
         for item in response.get('Items', []):
             if item.get('thumbnail_url') == thumbnail_url:
@@ -343,24 +352,23 @@ def handle_get_original_from_thumbnail(event):
             "statusCode": 500,
             "body": json.dumps({"error": "Internal server error"})
         }
-        
 
 
 def handle_query_from_tags_file(event):
     if event['httpMethod'] != 'POST':
         return {"statusCode": 405, "body": json.dumps({"error": "Method not allowed"})}
-    
+
     try:
         body = event.get('body', '')
-        
+
         if event.get('isBase64Encoded'):
             body = base64.b64decode(body).decode('utf-8')
-        
+
         if 'form-data' in body:
             lines = body.split('\n')
             content = []
             found_content = False
-            
+
             for line in lines:
                 if not line.strip() and not found_content:
                     found_content = True
@@ -369,17 +377,17 @@ def handle_query_from_tags_file(event):
                     content.append(line.strip())
                 elif found_content and line.startswith('--'):
                     break
-            
+
             body = '\n'.join(content).strip()
-        
+
         tag_list = parse_content(body)
         if not tag_list:
             return {"statusCode": 400, "body": json.dumps({"error": "No valid tags found"})}
-        
+
         response = table.scan()
         matches = []
         seen = set()
-        
+
         for tag_entry in tag_list:
             for tag, count in tag_entry.items():
                 for item in response.get('Items', []):
@@ -394,12 +402,12 @@ def handle_query_from_tags_file(event):
                                 "tags": item_tags
                             }))
                             seen.add(url)
-        
+
         return {
             "statusCode": 200,
             "body": json.dumps({"data": matches})
         }
-    
+
     except Exception as e:
         print(f"Error: {e}")
         return {"statusCode": 500, "body": json.dumps({"error": "Server error"})}
@@ -419,15 +427,14 @@ def handle_delete_files(event):
         deleted_items = []
 
         for url in urls:
-           
+
             if f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/" in url:
                 key = url.split(f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/")[-1]
             elif url.startswith("s3://"):
                 key = url.split(f"s3://{BUCKET_NAME}/")[-1]
             else:
-                continue  
+                continue
 
-           
             try:
                 s3.delete_object(Bucket=BUCKET_NAME, Key=key)
             except Exception as s3_err:
@@ -442,9 +449,8 @@ def handle_delete_files(event):
                 except Exception as e:
                     print(f"[WARNING] Thumbnail not found or error deleting: {thumb_key}")
 
-           
             try:
-                table.delete_item(Key={"id": original_key,"user_id":"User999"})
+                table.delete_item(Key={"id": original_key, "user_id": "User999"})
             except Exception as db_err:
                 print(f"[ERROR] Failed to delete {key} from DynamoDB: {db_err}")
                 continue
@@ -487,22 +493,22 @@ def handle_manual_tagging(event):
                 try:
                     tags[tag.strip()] = int(count.strip())
                 except ValueError:
-                    continue  
+                    continue
 
         for url in urls:
             key = url.split(f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/")[-1]
-            response = table.get_item(Key={'id': key,"user_id":"User999"})
+            response = table.get_item(Key={'id': key, "user_id": "User999"})
             item = response.get('Item')
 
             if not item:
-                continue  
+                continue
 
             current_tags = item.get('tags', {})
 
-            if operation == 1: 
+            if operation == 1:
                 for tag, count in tags.items():
                     current_tags[tag] = current_tags.get(tag, 0) + count
-            elif operation == 0:  
+            elif operation == 0:
                 for tag in tags:
                     if tag in current_tags:
                         del current_tags[tag]
