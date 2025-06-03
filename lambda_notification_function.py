@@ -3,15 +3,11 @@ import os
 import json
 
 sns = boto3.client('sns')
-SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')  # e.g. arn:aws:sns:us-east-1:xxxx:bird-tag-updates
+SNS_TOPIC_ARN = os.environ.get('arn:aws:sns:us-east-1:533267069889:new-bird-tag')
 
 def sned_notifications(tags: dict, file_url: str):
     """
     Publish a tag-based notification to SNS when a file is uploaded and tagged.
-
-    Args:
-        tags (dict): Detected tags from model, e.g. {'crow': 2, 'sparrow': 1}
-        file_url (str): S3 URL of the uploaded media file
     """
     try:
         species = list(tags.keys())

@@ -8,6 +8,8 @@ from urllib.parse import unquote_plus
 import requests
 from decimal import Decimal
 
+from lambda_notification_function import sns, SNS_TOPIC_ARN
+
 s3 = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
 BUCKET_NAME = os.environ.get('BUCKET_NAME', 'birds-detection-bucket')
@@ -125,6 +127,7 @@ def lambda_handler(event, context):
         }
 
 
+
 def handle_trigger_s3(event):
     for record in event['Records']:
         key = unquote_plus(record['s3']['object']['key'])
@@ -135,6 +138,21 @@ def handle_trigger_s3(event):
         tags = detect_birds_tags(tmp_file.name, file_type)
         print(f"[DEBUG] Raw API response tags: {tags}")
         tags = sanitize_tags(tags)
+
+        # new logic for notification
+        new_tags = ["hawk", "duck", "goose"]  # can change it
+        for tag in tags:
+            if tag.lower() in new_tags:
+                try:
+                    sns.publish(
+                        TopicArn=SNS_TOPIC_ARN,
+                        Subject='New Bird Tagged Alert',
+                        Message=f"New Bird Tagged has been uploaded!"
+                    )
+                    print(f"[INFO] SNS notification sent for tag: {tag}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to send SNS notification: {e}")
+
 
         s3_url = f"s3://{BUCKET_NAME}/{key}"
         thumbnail_url = None
