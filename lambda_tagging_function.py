@@ -122,12 +122,25 @@ def lambda_handler(event, context):
         else:
             return {
                 "statusCode": 404,
-                "body": json.dumps({"error": "Resource not found"})
+                "body": json.dumps({"error": "Resource not found"}),
+                "headers": {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                }
+
             }
     else:
         return {
             "statusCode": 400,
-            "body": json.dumps({"error": "Unknown event source"})
+            "body": json.dumps({"error": "Unknown event source"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
 
@@ -142,6 +155,33 @@ def handle_trigger_s3(event):
         tags = detect_birds_tags(tmp_file.name, file_type)
         print(f"[DEBUG] Raw API response tags: {tags}")
         tags = sanitize_tags(tags)
+
+        # handle notification logic
+        try:
+            response = table.scan()
+            all_existing_tags = set()
+            for item in response.get('Items', []):
+                item_tags = item.get('tags', {})
+                all_existing_tags.update(tag.lower() for tag in item_tags)
+
+            new_species = [tag for tag in tags if tag.lower() not in all_existing_tags]
+
+            if new_species:
+                bird_species_str = ", ".join(new_species)
+                message_email = {
+                    "message": f"The new bird species has been updated: {bird_species_str}."
+                }
+
+                sns.publish(
+                    TopicArn="arn:aws:sns:us-east-1:301627179176:birdtag-sns",
+                    Subject=f"New Bird Species Alert: {bird_species_str}",
+                    Message=message_email
+                )
+                print(f"[SNS] Notification published for new tags: {new_species}")
+            else:
+                print("[SNS] No new species detected — no notification sent.")
+        except Exception as e:
+            print(f"[ERROR] Failed to check or send SNS notification: {e}")
 
         s3_url = f"s3://{BUCKET_NAME}/{key}"
         thumbnail_url = None
@@ -172,27 +212,17 @@ def handle_trigger_s3(event):
             }
             table.put_item(Item=item)
 
-        # logic handle for notification
-        try:
-            bird_species = list(tags.keys())
-            bird_species_str = ",".join(bird_species)
-            message_email = {
-                "message": f"The new bird species has been updated: {bird_species_str}.",
-                "file_url": original_url
-            }
 
-            sns.publish(
-                TopicArn=os.environ['SNS_TOPIC_ARN'],  # change it to topic arn after create the new arn
-                Subject=f"New Bird Species Alert: {bird_species_str} ",
-                Message=json.dumps(message_email)
-            )
-            print(f"[SNS] Notification published for {original_url}")
-        except Exception as e:
-            print(f"[ERROR] Failed to send SNS notification: {e}")
 
     return {
         'statusCode': 200,
-        'body': 'Metadata stored in DynamoDB.'
+        'body': 'Metadata stored in DynamoDB.',
+        "headers": {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+            'Access-Control-Allow-Methods': 'POST,OPTIONS'
+        }
     }
 
 
@@ -212,18 +242,36 @@ def handle_search_by_tags(event):
         except:
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Invalid JSON in POST body"})
+                "body": json.dumps({"error": "Invalid JSON in POST body"}),
+                "headers": {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                }
             }
     else:
         return {
             "statusCode": 405,
-            "body": json.dumps({"error": "Method not allowed"})
+            "body": json.dumps({"error": "Method not allowed"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
     if not tags:
         return {
             "statusCode": 400,
-            "body": json.dumps({"error": "No tags provided"})
+            "body": json.dumps({"error": "No tags provided"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
     try:
@@ -241,14 +289,26 @@ def handle_search_by_tags(event):
 
         return {
             "statusCode": 200,
-            "body": json.dumps({"data": matches})
+            "body": json.dumps({"data": matches}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
     except Exception as e:
         print(f"[ERROR] DynamoDB query failed: {e}")
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error"})
+            "body": json.dumps({"error": "Internal server error"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
 
@@ -258,7 +318,8 @@ def handle_api_status(event):
         "headers": {
             "Content-Type": "application/json"
         },
-        "body": json.dumps({"status": "API is running"})
+        "body": json.dumps({"status": "API is running"}),
+
     }
 
 
@@ -266,7 +327,13 @@ def handle_search_by_species(event):
     if event['httpMethod'] != 'POST':
         return {
             "statusCode": 405,
-            "body": json.dumps({"error": "Method not allowed"})
+            "body": json.dumps({"error": "Method not allowed"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
     try:
@@ -274,18 +341,36 @@ def handle_search_by_species(event):
         if not isinstance(species_tags, list) or not all(isinstance(tag, str) for tag in species_tags):
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Request body must be a list of tag strings"})
+                "body": json.dumps({"error": "Request body must be a list of tag strings"}),
+                "headers": {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                }
             }
     except:
         return {
             "statusCode": 400,
-            "body": json.dumps({"error": "Invalid JSON in POST body"})
+            "body": json.dumps({"error": "Invalid JSON in POST body"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
     if not species_tags:
         return {
             "statusCode": 400,
-            "body": json.dumps({"error": "No tags provided"})
+            "body": json.dumps({"error": "No tags provided"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
     try:
@@ -303,14 +388,26 @@ def handle_search_by_species(event):
 
         return {
             "statusCode": 200,
-            "body": json.dumps({"data": matches})
+            "body": json.dumps({"data": matches}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
     except Exception as e:
         print(f"[ERROR] DynamoDB query failed: {e}")
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error"})
+            "body": json.dumps({"error": "Internal server error"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
 
@@ -318,7 +415,13 @@ def handle_get_original_from_thumbnail(event):
     if event['httpMethod'] != 'POST':
         return {
             "statusCode": 405,
-            "body": json.dumps({"error": "Method not allowed"})
+            "body": json.dumps({"error": "Method not allowed"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
     try:
         body = json.loads(event.get('body', '{}'))
@@ -327,7 +430,13 @@ def handle_get_original_from_thumbnail(event):
         if not thumbnail_url:
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Missing 'thumbnail_url' in request body"})
+                "body": json.dumps({"error": "Missing 'thumbnail_url' in request body"}),
+                "headers": {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                }
             }
 
         response = table.scan()
@@ -338,19 +447,37 @@ def handle_get_original_from_thumbnail(event):
                     "body": json.dumps({
                         "original_url": item.get("original_url"),
                         "type": item.get("type")
-                    })
+                    }),
+                    "headers": {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                        'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                    }
                 }
 
         return {
             "statusCode": 404,
-            "body": json.dumps({"error": "Thumbnail not found"})
+            "body": json.dumps({"error": "Thumbnail not found"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
     except Exception as e:
         print(f"[ERROR] Failed to fetch original from thumbnail: {e}")
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error"})
+            "body": json.dumps({"error": "Internal server error"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
 
