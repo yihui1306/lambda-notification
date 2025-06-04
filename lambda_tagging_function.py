@@ -1,4 +1,6 @@
 import base64
+import email
+from io import BytesIO
 
 import boto3
 import json
@@ -119,6 +121,8 @@ def lambda_handler(event, context):
             return handle_delete_files(event)
         elif http_method == 'POST' and resource == '/api/manual-tagging':
             return handle_manual_tagging(event)
+        elif http_method == 'POST' and resource == '/api/uploads':
+            return handle_uploads(event)
         else:
             return {
                 "statusCode": 404,
@@ -212,8 +216,6 @@ def handle_trigger_s3(event):
             }
             table.put_item(Item=item)
 
-
-
     return {
         'statusCode': 200,
         'body': 'Metadata stored in DynamoDB.',
@@ -224,6 +226,7 @@ def handle_trigger_s3(event):
             'Access-Control-Allow-Methods': 'POST,OPTIONS'
         }
     }
+
 
 
 def handle_search_by_tags(event):
@@ -720,3 +723,70 @@ def handle_manual_tagging(event):
                 'Access-Control-Allow-Methods': 'POST,OPTIONS'
             }
         }
+
+def handle_uploads(event):
+    if event['httpMethod'] == 'OPTIONS':
+        return {
+            "statusCode": 200,
+            "headers": cors_headers(),
+            "body": ""
+        }
+
+    try:
+        # Decode multipart/form-data
+        content_type = event['headers'].get('Content-Type') or event['headers'].get('content-type')
+        body = base64.b64decode(event['body']) if event.get('isBase64Encoded', False) else event['body']
+        msg = email.message_from_bytes(body if isinstance(body, bytes) else body.encode(), policy=email.policy.default)
+
+        file_part = next((p for p in msg.walk() if "filename=" in (p.get("Content-Disposition") or "")), None)
+        if not file_part:
+            raise ValueError("No file found in upload")
+
+        file_data = file_part.get_payload(decode=True)
+        file_name = file_part.get_filename()
+        mime_type = file_part.get_content_type()
+        file_type = 'image' if mime_type.startswith("image/") else 'video'
+
+        # upload to S3
+        key = f"{'images' if file_type == 'image' else 'videos'}/original/{file_name}"
+        s3.upload_fileobj(BytesIO(file_data), BUCKET_NAME, key)
+
+        # tag detect
+        tmp_file = tempfile.NamedTemporaryFile(delete=False)
+        tmp_file.write(file_data)
+        tmp_file.flush()
+        tags = sanitize_tags(detect_birds_tags(tmp_file.name, file_type))
+
+        # Store metadata in DynamoDB
+        original_url = f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/{key}"
+        thumbnail_url = original_url.replace("/original/", "/thumbnails/") if file_type == 'image' else "NO_URL"
+
+        table.put_item(Item={
+            'id': key,
+            'user_id': 'User999',
+            'original_url': original_url,
+            'type': file_type,
+            'thumbnail_url': thumbnail_url,
+            'tags': tags or {"unknown_bird": 1}
+        })
+
+        return {
+            "statusCode": 200,
+            "headers": cors_headers(),
+            "body": json.dumps({"message": "Upload success", "file_url": original_url})
+        }
+
+    except Exception as e:
+        print(f"[ERROR] Upload handler failed: {e}")
+        return {
+            "statusCode": 500,
+            "headers": cors_headers(),
+            "body": json.dumps({"error": "Upload failed"})
+        }
+
+def cors_headers():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Methods": "OPTIONS,POST"
+    }
