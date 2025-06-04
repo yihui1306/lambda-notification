@@ -247,7 +247,7 @@ def handle_search_by_tags(event):
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*',
                     'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
                 }
             }
     else:
@@ -483,7 +483,15 @@ def handle_get_original_from_thumbnail(event):
 
 def handle_query_from_tags_file(event):
     if event['httpMethod'] != 'POST':
-        return {"statusCode": 405, "body": json.dumps({"error": "Method not allowed"})}
+        return {"statusCode": 405,
+                "body": json.dumps({"error": "Method not allowed"}),
+                "headers": {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                    }
+                }
 
     try:
         body = event.get('body', '')
@@ -509,7 +517,15 @@ def handle_query_from_tags_file(event):
 
         tag_list = parse_content(body)
         if not tag_list:
-            return {"statusCode": 400, "body": json.dumps({"error": "No valid tags found"})}
+            return {"statusCode": 400,
+                    "body": json.dumps({"error": "No valid tags found"}),
+                    "headers": {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                        'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                        }
+                    }
 
         response = table.scan()
         matches = []
@@ -532,12 +548,26 @@ def handle_query_from_tags_file(event):
 
         return {
             "statusCode": 200,
-            "body": json.dumps({"data": matches})
+            "body": json.dumps({"data": matches}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
     except Exception as e:
         print(f"Error: {e}")
-        return {"statusCode": 500, "body": json.dumps({"error": "Server error"})}
+        return {"statusCode": 500,
+                "body": json.dumps({"error": "Server error"}),
+                "headers": {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                    }
+                }
 
 
 def handle_delete_files(event):
@@ -548,7 +578,13 @@ def handle_delete_files(event):
         if not urls or not isinstance(urls, list):
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Missing or invalid 'urls' list in request"})
+                "body": json.dumps({"error": "Missing or invalid 'urls' list in request"}),
+                "headers": {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                }
             }
 
         deleted_items = []
@@ -589,14 +625,26 @@ def handle_delete_files(event):
             "body": json.dumps({
                 "message": "Files deleted successfully",
                 "deleted": deleted_items
-            })
+            }),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
     except Exception as e:
         print(f"[ERROR] {e}")
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error"})
+            "body": json.dumps({"error": "Internal server error"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
 
@@ -610,7 +658,13 @@ def handle_manual_tagging(event):
         if not isinstance(urls, list) or not isinstance(tag_list, list):
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Invalid format for 'url' or 'tags'. Must be lists."})
+                "body": json.dumps({"error": "Invalid format for 'url' or 'tags'. Must be lists."}),
+                "headers": {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                }
             }
 
         tags = {}
@@ -645,12 +699,24 @@ def handle_manual_tagging(event):
 
         return {
             "statusCode": 200,
-            "body": json.dumps({"message": "Tags updated successfully"})
+            "body": json.dumps({"message": "Tags updated successfully"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
 
     except Exception as e:
         print(f"[ERROR] {e}")
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error"})
+            "body": json.dumps({"error": "Internal server error"}),
+            "headers": {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            }
         }
