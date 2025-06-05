@@ -1,4 +1,5 @@
 import base64
+import cgi
 import email
 from io import BytesIO
 
@@ -10,6 +11,8 @@ from urllib.parse import unquote_plus
 import requests
 from decimal import Decimal
 import sns
+from PIL import Image
+import io
 
 s3 = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
@@ -226,7 +229,6 @@ def handle_trigger_s3(event):
             'Access-Control-Allow-Methods': 'POST,OPTIONS'
         }
     }
-
 
 
 def handle_search_by_tags(event):
@@ -493,7 +495,7 @@ def handle_query_from_tags_file(event):
                     'Access-Control-Allow-Origin': '*',
                     'Access-Control-Allow-Headers': 'Content-Type,Authorization',
                     'Access-Control-Allow-Methods': 'POST,OPTIONS'
-                    }
+                }
                 }
 
     try:
@@ -527,7 +529,7 @@ def handle_query_from_tags_file(event):
                         'Access-Control-Allow-Origin': '*',
                         'Access-Control-Allow-Headers': 'Content-Type,Authorization',
                         'Access-Control-Allow-Methods': 'POST,OPTIONS'
-                        }
+                    }
                     }
 
         response = table.scan()
@@ -569,7 +571,7 @@ def handle_query_from_tags_file(event):
                     'Access-Control-Allow-Origin': '*',
                     'Access-Control-Allow-Headers': 'Content-Type,Authorization',
                     'Access-Control-Allow-Methods': 'POST,OPTIONS'
-                    }
+                }
                 }
 
 
@@ -724,69 +726,104 @@ def handle_manual_tagging(event):
             }
         }
 
-def handle_uploads(event):
-    if event['httpMethod'] == 'OPTIONS':
-        return {
-            "statusCode": 200,
-            "headers": cors_headers(),
-            "body": ""
+
+def create_thumbnail(image_bytes, size=(256, 256)):
+    im = Image.open(BytesIO(image_bytes))
+    im.thumbnail(size)
+    out = io.BytesIO()
+    im.save(out, format="JPEG")
+    out.seek(0)
+    return out
+
+
+def uploads_handler(event):
+    try:
+        # CORS headers
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Content-Type': 'application/json'
         }
 
-    try:
-        # Decode multipart/form-data
-        content_type = event['headers'].get('Content-Type') or event['headers'].get('content-type')
-        body = base64.b64decode(event['body']) if event.get('isBase64Encoded', False) else event['body']
-        msg = email.message_from_bytes(body if isinstance(body, bytes) else body.encode(), policy=email.policy.default)
+        # Handle CORS preflight
+        if event.get('httpMethod') == 'OPTIONS':
+            return {
+                'statusCode': 200,
+                'headers': headers,
+                'body': ''
+            }
 
-        file_part = next((p for p in msg.walk() if "filename=" in (p.get("Content-Disposition") or "")), None)
-        if not file_part:
-            raise ValueError("No file found in upload")
+        if event.get('httpMethod') != 'POST':
+            return {
+                'statusCode': 405,
+                'headers': headers,
+                'body': json.dumps({'error': 'Method not allowed'})
+            }
 
-        file_data = file_part.get_payload(decode=True)
-        file_name = file_part.get_filename()
-        mime_type = file_part.get_content_type()
-        file_type = 'image' if mime_type.startswith("image/") else 'video'
+        # Parse request body
+        try:
+            body = json.loads(event.get('body', '{}'))
+        except json.JSONDecodeError:
+            return {
+                'statusCode': 400,
+                'headers': headers,
+                'body': json.dumps({'error': 'Invalid JSON body'})
+            }
 
-        # upload to S3
-        key = f"{'images' if file_type == 'image' else 'videos'}/original/{file_name}"
-        s3.upload_fileobj(BytesIO(file_data), BUCKET_NAME, key)
+        file_name = body.get('fileName')
+        file_type = body.get('fileType')
 
-        # tag detect
-        tmp_file = tempfile.NamedTemporaryFile(delete=False)
-        tmp_file.write(file_data)
-        tmp_file.flush()
-        tags = sanitize_tags(detect_birds_tags(tmp_file.name, file_type))
+        if not file_name or not file_type:
+            return {
+                'statusCode': 400,
+                'headers': headers,
+                'body': json.dumps({'error': 'fileName and fileType are required'})
+            }
 
-        # Store metadata in DynamoDB
-        original_url = f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/{key}"
-        thumbnail_url = original_url.replace("/original/", "/thumbnails/") if file_type == 'image' else "NO_URL"
+        # Generate unique key for the file in images/uploads/ folder
+        # timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = "05062025"
+        # unique_id = str(uuid.uuid4())[:8]
+        unique_id = "001"
+        # Clean filename to avoid issues
+        clean_filename = file_name.replace(' ', '_').replace('(', '').replace(')', '')
+        key = f"images/uploads/{timestamp}_{unique_id}_{clean_filename}"
 
-        table.put_item(Item={
-            'id': key,
-            'user_id': 'User999',
-            'original_url': original_url,
-            'type': file_type,
-            'thumbnail_url': thumbnail_url,
-            'tags': tags or {"unknown_bird": 1}
-        })
+        # Generate presigned URL for PUT operation
+        presigned_url = s3.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': BUCKET_NAME,
+                'Key': key,
+                'ContentType': file_type
+            },
+            ExpiresIn=300  # 5 minutes
+        )
 
         return {
-            "statusCode": 200,
-            "headers": cors_headers(),
-            "body": json.dumps({"message": "Upload success", "file_url": original_url})
+            'statusCode': 200,
+            'headers': headers,
+            'body': json.dumps({
+                'presignedUrl': presigned_url,
+                'key': key,
+                'expiresIn': 300
+            })
         }
 
     except Exception as e:
-        print(f"[ERROR] Upload handler failed: {e}")
-        return {
-            "statusCode": 500,
-            "headers": cors_headers(),
-            "body": json.dumps({"error": "Upload failed"})
-        }
+        print(f"Error generating presigned URL: {str(e)}")
 
-def cors_headers():
-    return {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-        "Access-Control-Allow-Methods": "OPTIONS,POST"
-    }
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                'Content-Type': 'application/json'
+            },
+            'body': json.dumps({
+                'error': 'Failed to generate upload URL',
+                'message': str(e)
+            })
+        }
