@@ -1,20 +1,19 @@
-import base64
-import cgi
-import email
-from io import BytesIO
-
 import boto3
 import json
+import uuid
 import os
+import cgi
 import tempfile
 from urllib.parse import unquote_plus
 import requests
 from decimal import Decimal
-import sns
-from PIL import Image
-import io
+import base64
+from io import BytesIO
+import traceback
+import mimetypes
 
 s3 = boto3.client('s3')
+sns = boto3.client('sns')
 dynamodb = boto3.resource('dynamodb')
 BUCKET_NAME = os.environ.get('BUCKET_NAME', 'birds-detection-bucket')
 TABLE_NAME = os.environ.get('TABLE_NAME', 'birds-detection-data')
@@ -24,6 +23,25 @@ table = dynamodb.Table(TABLE_NAME)
 
 
 # Helper functions
+
+def get_user_email_from_event(event):
+    try:
+        auth_header = event["headers"].get("Authorization") or event["headers"].get("authorization")
+        if not auth_header:
+            print("[WARNING] No Authorization header found")
+            return "UnknownUser"
+
+        token = auth_header.split(" ")[1]
+        padded = token.split('.')[1] + '=='
+        decoded = base64.b64decode(padded)
+        payload = json.loads(decoded)
+        email = payload.get("email", "UnknownUser")
+        print(f"[DEBUG] Extracted email from token: {email}")
+        return email
+    except Exception as e:
+        print(f"[WARNING] Failed to extract user email: {e}")
+        return "UnknownUser"
+
 
 def convert_decimals(obj):
     if isinstance(obj, list):
@@ -68,27 +86,16 @@ def sanitize_tags(tags):
 
 
 def detect_birds_tags(file_path, file_type, image_url=None):
-    url = f"http://54.146.219.94:8000/predict/{file_type}"
+    print(f"Triggered detect birds")
+    audio_url = f"http://3.95.164.117:8000/analyze-audio"
     files = {}
     data = {}
 
     try:
-        if file_type == "image":
-            if file_path:
-                with open(file_path, "rb") as f:
-                    files["image_file"] = (os.path.basename(file_path), f)
-                    response = requests.post(url, files=files, data=data, timeout=60)
-            elif image_url:
-                data["image_url"] = image_url
-                response = requests.post(url, data=data, timeout=60)
-            else:
-                print("[ERROR] Provide either a file path or image URL.")
-                return {}
-
-        elif file_type == "video":
+        if file_type == "audio":
             with open(file_path, "rb") as f:
-                files["video_file"] = (os.path.basename(file_path), f)
-                response = requests.post(url, files=files, timeout=300)
+                files["file"] = (os.path.basename(file_path), f, "audio/wav")
+                response = requests.post(audio_url, files=files, timeout=360)
 
         else:
             print(f"[ERROR] Unsupported file_type: {file_type}")
@@ -96,6 +103,10 @@ def detect_birds_tags(file_path, file_type, image_url=None):
 
         response.raise_for_status()
         result = response.json()
+
+        print("[DEBUG detect_birds_tags] API response json:", result)
+        print("[DEBUG detect_birds_tags] tags:", result.get("tags", {}))
+
         return result.get("tags", {})
 
     except requests.exceptions.RequestException as e:
@@ -119,48 +130,76 @@ def lambda_handler(event, context):
         elif http_method == 'POST' and resource == '/api/get-original-from-thumbnail':
             return handle_get_original_from_thumbnail(event)
         elif http_method == 'POST' and resource == '/api/query-from-file':
-            return handle_query_from_tags_file(event)
+            # return handle_query_from_tags_file(event)
+            return handle_query_from_media(event, context)
         elif http_method == 'POST' and resource == '/api/delete-files':
             return handle_delete_files(event)
         elif http_method == 'POST' and resource == '/api/manual-tagging':
             return handle_manual_tagging(event)
         elif http_method == 'POST' and resource == '/api/uploads':
-            return handle_uploads(event)
+            return uploads_handler(event)
         else:
             return {
                 "statusCode": 404,
-                "body": json.dumps({"error": "Resource not found"}),
                 "headers": {
                     'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
-                }
-
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                    "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+                },
+                "body": json.dumps({"error": "Resource not found"})
             }
     else:
         return {
             "statusCode": 400,
-            "body": json.dumps({"error": "Unknown event source"}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"error": "Unknown event source"})
         }
 
 
+# def get_user_id(event):
+#     #get user email as user id
+#     print(event["Records"])
+#     try:
+#         return event["Records"]["authorizer"]["claims"]["email"]
+#     except KeyError:
+#         return "UnknownUser"
+
 def handle_trigger_s3(event):
+    print(f"[DEBUG] S3 trigger event received: {json.dumps(event)}")
     for record in event['Records']:
         key = unquote_plus(record['s3']['object']['key'])
-        file_type = 'image' if key.startswith('images/original/') else 'video'
+        print(f"[DEBUG] Processing S3 object key: {key}")
+        file_type = ''
+        if key.startswith('audio/') or key.endswith(('.wav', '.mp3')):
+            file_type = 'audio'
+        # new
+        user_id = ''
+        try:
+            head = s3.head_object(Bucket=BUCKET_NAME, Key=key)
+            print(f"[DEBUG] S3 object metadata: {head.get('Metadata', {})}")
+            user_id = head.get("Metadata", {}).get("user_id", "UnknownUser") or head.get("Metadata", {}).get("user-id",
+                                                                                                             "UnknownUser")
+            print(f"[DEBUG] Extracted user_id: {user_id}")
+        except Exception as e:
+            print(f"[ERROR] Failed to get S3 metadata for key {key}: {e}")
+            user_id = "UnknownUser"
 
         tmp_file = tempfile.NamedTemporaryFile(delete=False)
         s3.download_file(BUCKET_NAME, key, tmp_file.name)
 
         tags = detect_birds_tags(tmp_file.name, file_type)
         print(f"[DEBUG] Raw API response tags: {tags}")
+        print("[DEBUG handler] Tags returned from detection:", tags)
+
+        # debug
+        # Before passing to sanitize_tags, ensure tags is not None
+        tags = tags or {"unknown_bird": 1}
         tags = sanitize_tags(tags)
 
         # handle notification logic
@@ -175,9 +214,8 @@ def handle_trigger_s3(event):
 
             if new_species:
                 bird_species_str = ", ".join(new_species)
-                message_email = {
-                    "message": f"The new bird species has been updated: {bird_species_str}."
-                }
+                message_email = f"The new bird species has been updated: {bird_species_str}."
+                # message_text = message.key + message.value
 
                 sns.publish(
                     TopicArn="arn:aws:sns:us-east-1:301627179176:birdtag-sns",
@@ -193,25 +231,12 @@ def handle_trigger_s3(event):
         s3_url = f"s3://{BUCKET_NAME}/{key}"
         thumbnail_url = None
         original_url = None
-        if file_type == 'image':
-            original_url = f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/{key}"
-            thumbnail_key = key.replace('images/original/', 'images/thumbnails/')
-            thumbnail_url = f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/{thumbnail_key}"
-            item = {
-                'id': key,
-                'user_id': 'User999',
-                'original_url': original_url,
-                'type': file_type,
-                'thumbnail_url': thumbnail_url,
-                'tags': tags or {"unknown_bird": 1}
-            }
-            table.put_item(Item=item)
 
-        else:
+        if file_type == 'audio':
             original_url = f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/{key}"
             item = {
                 'id': key,
-                'user_id': 'User999',
+                'user_id': user_id,  # new
                 'original_url': original_url,
                 'type': file_type,
                 'thumbnail_url': "NO_URL",
@@ -221,62 +246,64 @@ def handle_trigger_s3(event):
 
     return {
         'statusCode': 200,
-        'body': 'Metadata stored in DynamoDB.',
         "headers": {
             'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-            'Access-Control-Allow-Methods': 'POST,OPTIONS'
-        }
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+        },
+        'body': 'Metadata stored in DynamoDB.'
     }
 
 
 def handle_search_by_tags(event):
+    cors_headers = {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+    }
+    if event['httpMethod'] == 'OPTIONS':
+        return {
+            "statusCode": 200,
+            "headers": cors_headers,
+            "body": ""
+        }
     if event['httpMethod'] == 'GET':
-        tags = {}
-        params = event.get('queryStringParameters', {})
-        if params:
-            for key, value in params.items():
-                if key.startswith('tag') and f'count{key[3:]}' in params:
-                    tag = value
-                    count = int(params.get(f'count{key[3:]}', 0))
-                    tags[tag] = count
+        return {
+            "statusCode": 200,
+            "headers": cors_headers,
+            "body": "you reach the get endpoint"
+        }
+        # tags = {}
+        # params = event.get('queryStringParameters', {})
+        # if params:
+        #     for key, value in params.items():
+        #         if key.startswith('tag') and f'count{key[3:]}' in params:
+        #             tag = value
+        #             count = int(params.get(f'count{key[3:]}', 0))
+        #             tags[tag] = count
     elif event['httpMethod'] == 'POST':
         try:
             tags = json.loads(event.get('body', '{}'))
         except:
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Invalid JSON in POST body"}),
-                "headers": {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-                }
+                "headers": cors_headers,
+                "body": json.dumps({"error": "Invalid JSON in POST body"})
             }
     else:
         return {
             "statusCode": 405,
-            "body": json.dumps({"error": "Method not allowed"}),
-            "headers": {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+            "headers": cors_headers,
+            "body": json.dumps({"error": "Method not allowed"})
         }
 
     if not tags:
         return {
             "statusCode": 400,
-            "body": json.dumps({"error": "No tags provided"}),
-            "headers": {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+            "headers": cors_headers,
+            "body": json.dumps({"error": "No tags provided"})
         }
 
     try:
@@ -294,26 +321,16 @@ def handle_search_by_tags(event):
 
         return {
             "statusCode": 200,
-            "body": json.dumps({"data": matches}),
-            "headers": {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+            "headers": cors_headers,
+            "body": json.dumps({"data": matches})
         }
 
     except Exception as e:
         print(f"[ERROR] DynamoDB query failed: {e}")
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error"}),
-            "headers": {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+            "headers": cors_headers,
+            "body": json.dumps({"error": "Internal server error"})
         }
 
 
@@ -321,10 +338,12 @@ def handle_api_status(event):
     return {
         "statusCode": 200,
         "headers": {
-            "Content-Type": "application/json"
+            'Content-Type': 'application/json',
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Allow-Methods": "OPTIONS,GET"
         },
-        "body": json.dumps({"status": "API is running"}),
-
+        "body": json.dumps({"status": "API is running"})
     }
 
 
@@ -332,13 +351,13 @@ def handle_search_by_species(event):
     if event['httpMethod'] != 'POST':
         return {
             "statusCode": 405,
-            "body": json.dumps({"error": "Method not allowed"}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"error": "Method not allowed"})
         }
 
     try:
@@ -346,36 +365,36 @@ def handle_search_by_species(event):
         if not isinstance(species_tags, list) or not all(isinstance(tag, str) for tag in species_tags):
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Request body must be a list of tag strings"}),
                 "headers": {
                     'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
-                }
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                    "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+                },
+                "body": json.dumps({"error": "Request body must be a list of tag strings"})
             }
     except:
         return {
             "statusCode": 400,
-            "body": json.dumps({"error": "Invalid JSON in POST body"}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"error": "Invalid JSON in POST body"})
         }
 
     if not species_tags:
         return {
             "statusCode": 400,
-            "body": json.dumps({"error": "No tags provided"}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"error": "No tags provided"})
         }
 
     try:
@@ -393,26 +412,26 @@ def handle_search_by_species(event):
 
         return {
             "statusCode": 200,
-            "body": json.dumps({"data": matches}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"data": matches})
         }
 
     except Exception as e:
         print(f"[ERROR] DynamoDB query failed: {e}")
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error"}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"error": "Internal server error"})
         }
 
 
@@ -420,13 +439,13 @@ def handle_get_original_from_thumbnail(event):
     if event['httpMethod'] != 'POST':
         return {
             "statusCode": 405,
-            "body": json.dumps({"error": "Method not allowed"}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"error": "Method not allowed"})
         }
     try:
         body = json.loads(event.get('body', '{}'))
@@ -435,13 +454,13 @@ def handle_get_original_from_thumbnail(event):
         if not thumbnail_url:
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Missing 'thumbnail_url' in request body"}),
                 "headers": {
                     'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
-                }
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                    "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+                },
+                "body": json.dumps({"error": "Missing 'thumbnail_url' in request body"})
             }
 
         response = table.scan()
@@ -449,42 +468,45 @@ def handle_get_original_from_thumbnail(event):
             if item.get('thumbnail_url') == thumbnail_url:
                 return {
                     "statusCode": 200,
-                    "body": json.dumps({
-                        "original_url": item.get("original_url"),
-                        "type": item.get("type")
-                    }),
                     "headers": {
                         'Content-Type': 'application/json',
-                        'Access-Control-Allow-Origin': '*',
-                        'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                        'Access-Control-Allow-Methods': 'POST,OPTIONS'
-                    }
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                        "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+                    },
+                    "body": json.dumps({
+                        "original_url": item.get("original_url"),
+                        "thumbnail_url": thumbnail_url,
+                        "type": item.get("type")
+                    })
                 }
 
         return {
             "statusCode": 404,
-            "body": json.dumps({"error": "Thumbnail not found"}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"error": "Thumbnail not found"})
         }
 
     except Exception as e:
         print(f"[ERROR] Failed to fetch original from thumbnail: {e}")
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error"}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"error": "Internal server error"})
         }
 
+
+##########################################
 
 def handle_query_from_tags_file(event):
     if event['httpMethod'] != 'POST':
@@ -575,21 +597,105 @@ def handle_query_from_tags_file(event):
                 }
 
 
+# wen try
+def handle_query_from_media(event, _ctx=None):
+    cors_headers = {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        "Access-Control-Allow-Methods": "POST,OPTIONS"
+    }
+    # CORS preflight
+    if event.get("httpMethod") == "OPTIONS":
+        return {"statusCode": 200, "headers": cors_headers}
+
+    if event["httpMethod"] != "POST":
+        return {"statusCode": 405, "headers": cors_headers,
+                "body": json.dumps({"error": "Method not allowed"})}
+
+    try:
+        # ── 1. Decode & parse multipart ───────────────────────────────
+        raw_body = base64.b64decode(event["body"]) if event.get("isBase64Encoded") else event["body"].encode()
+        env = {  # fake WSGI env for cgi.FieldStorage
+            "REQUEST_METHOD": "POST",
+            "CONTENT_TYPE": event["headers"]["content-type"],
+            "CONTENT_LENGTH": str(len(raw_body)),
+        }
+        form = cgi.FieldStorage(fp=BytesIO(raw_body), environ=env, keep_blank_values=True)
+
+        # ── DEBUG START ────────────────────────────────────────────
+        print("content-type header:", env["CONTENT_TYPE"])
+        print("form.list ->", form.list)  # None means “no parts”
+        if form.list:
+            for i, part in enumerate(form.list):
+                print(f"Part {i}:")
+                print("  name     :", repr(part.name))
+                print("  filename :", repr(part.filename))
+                print("  type     :", repr(part.type))
+                print("  headers  :", dict(part.headers))
+                print("  value len:", len(part.value))
+        # ── DEBUG END ──────────────────────────────────────────────
+
+        file_item = form["file"]  # ← name attribute in the form
+        file_bytes = file_item.file.read()
+
+        # ── 2. Write to /tmp so TF/Torch can open it ──────────────────
+        tmp_name = f"/tmp/{uuid.uuid4().hex}"
+        with open(tmp_name, "wb") as f:
+            f.write(file_bytes)
+
+        # ── 3. Infer file_type & run detector ─────────────────────────
+        ext = os.path.splitext(file_item.filename)[1].lower()
+        mime = mimetypes.guess_type(file_item.filename)[0] or ""
+        file_type = ("image" if mime.startswith("image") else
+                     "video" if mime.startswith("video") else
+                     "audio" if mime.startswith("audio") else "unknown")
+
+        tags = detect_birds_tags(tmp_name, file_type)  # ← returns {tag: count}
+        os.remove(tmp_name)  # clean up tmp
+
+        # ── 4. Query DynamoDB for matches ────────────────────────────
+        response = table.scan()
+        matches = []
+        for item in response.get("Items", []):
+            item_tags = item.get("tags", {})
+            if all(item_tags.get(t, 0) >= c for t, c in tags.items()):
+                matches.append(convert_decimals({
+                    "original_url": item["original_url"],
+                    "thumbnail_url": item["thumbnail_url"],
+                    "type": item["type"]
+                }))
+
+        return {"statusCode": 200, "headers": cors_headers,
+                "body": json.dumps({"data": matches})}
+
+    except Exception as e:
+        print("[ERROR]", e)
+        return {"statusCode": 500, "headers": cors_headers,
+                "body": json.dumps({"error": "Internal server error"})}
+
+
+##########################################
+
+
 def handle_delete_files(event):
     try:
         body = json.loads(event.get("body", "{}"))
         urls = body.get("urls", [])
 
+        # new
+        user_id = get_user_email_from_event(event)
+
         if not urls or not isinstance(urls, list):
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Missing or invalid 'urls' list in request"}),
                 "headers": {
                     'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
-                }
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                    "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+                },
+                "body": json.dumps({"error": "Missing or invalid 'urls' list in request"})
             }
 
         deleted_items = []
@@ -618,7 +724,7 @@ def handle_delete_files(event):
                     print(f"[WARNING] Thumbnail not found or error deleting: {thumb_key}")
 
             try:
-                table.delete_item(Key={"id": original_key, "user_id": "User999"})
+                table.delete_item(Key={"id": original_key, "user_id": user_id})
             except Exception as db_err:
                 print(f"[ERROR] Failed to delete {key} from DynamoDB: {db_err}")
                 continue
@@ -627,29 +733,29 @@ def handle_delete_files(event):
 
         return {
             "statusCode": 200,
+            "headers": {
+                'Content-Type': 'application/json',
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
             "body": json.dumps({
                 "message": "Files deleted successfully",
                 "deleted": deleted_items
-            }),
-            "headers": {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+            })
         }
 
     except Exception as e:
         print(f"[ERROR] {e}")
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error"}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"error": "Internal server error"})
         }
 
 
@@ -663,13 +769,13 @@ def handle_manual_tagging(event):
         if not isinstance(urls, list) or not isinstance(tag_list, list):
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Invalid format for 'url' or 'tags'. Must be lists."}),
                 "headers": {
                     'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
-                }
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                    "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+                },
+                "body": json.dumps({"error": "Invalid format for 'url' or 'tags'. Must be lists."})
             }
 
         tags = {}
@@ -681,9 +787,12 @@ def handle_manual_tagging(event):
                 except ValueError:
                     continue
 
+                    # new add user id
+        user_id = get_user_email_from_event(event)
+
         for url in urls:
             key = url.split(f"https://{BUCKET_NAME}.s3.{REGION}.amazonaws.com/")[-1]
-            response = table.get_item(Key={'id': key, "user_id": "User999"})
+            response = table.get_item(Key={'id': key, "user_id": user_id})  # new
             item = response.get('Item')
 
             if not item:
@@ -704,36 +813,27 @@ def handle_manual_tagging(event):
 
         return {
             "statusCode": 200,
-            "body": json.dumps({"message": "Tags updated successfully"}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"message": "Tags updated successfully"})
         }
 
     except Exception as e:
         print(f"[ERROR] {e}")
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error"}),
             "headers": {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            }
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
+            },
+            "body": json.dumps({"error": "Internal server error"})
         }
-
-
-def create_thumbnail(image_bytes, size=(256, 256)):
-    im = Image.open(BytesIO(image_bytes))
-    im.thumbnail(size)
-    out = io.BytesIO()
-    im.save(out, format="JPEG")
-    out.seek(0)
-    return out
 
 
 def uploads_handler(event):
@@ -788,7 +888,24 @@ def uploads_handler(event):
         unique_id = "001"
         # Clean filename to avoid issues
         clean_filename = file_name.replace(' ', '_').replace('(', '').replace(')', '')
-        key = f"images/uploads/{timestamp}_{unique_id}_{clean_filename}"
+        # key = f"images/uploads/{timestamp}_{unique_id}_{clean_filename}"
+
+        # for deteted upload file
+        if file_type.startswith('image'):
+            key = f"images/uploads/{timestamp}_{unique_id}_{clean_filename}"
+        elif file_type.startswith('video'):
+            key = f"videos/{timestamp}_{unique_id}_{clean_filename}"
+        else:
+            return {
+                'statusCode': 400,
+                'headers': headers,
+                'body': json.dumps({'error': 'Unsupported fileType'})
+            }
+
+        # new Get user email before using it
+        userEmail = get_user_email_from_event(event)
+        print(f"[INFO] Presigned URL created by: {userEmail}")
+        print(f"[INFO] User email extracted: {userEmail}")
 
         # Generate presigned URL for PUT operation
         presigned_url = s3.generate_presigned_url(
@@ -796,9 +913,12 @@ def uploads_handler(event):
             Params={
                 'Bucket': BUCKET_NAME,
                 'Key': key,
-                'ContentType': file_type
+                'ContentType': file_type,
+                'Metadata': {
+                    'user_id': userEmail
+                }
             },
-            ExpiresIn=300  # 5 minutes
+            ExpiresIn=300
         )
 
         return {
@@ -807,6 +927,7 @@ def uploads_handler(event):
             'body': json.dumps({
                 'presignedUrl': presigned_url,
                 'key': key,
+                'user_id': userEmail,  # new
                 'expiresIn': 300
             })
         }
